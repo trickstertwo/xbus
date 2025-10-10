@@ -1,6 +1,10 @@
 package xbus
 
-import "time"
+import (
+	"time"
+
+	"github.com/trickstertwo/xlog"
+)
 
 // BusEventType enumerates internal lifecycle events for Observer pattern.
 type BusEventType string
@@ -35,3 +39,30 @@ type Observer interface {
 type ObserverFunc func(e BusEvent)
 
 func (f ObserverFunc) OnBusEvent(e BusEvent) { f(e) }
+
+// LoggingObserver is an Adapter that emits BusEvents via xlog.
+type LoggingObserver struct {
+	Logger *xlog.Logger
+}
+
+func (o LoggingObserver) OnBusEvent(e BusEvent) {
+	if o.Logger == nil {
+		return
+	}
+	ev := o.Logger.With(
+		xlog.Str("type", string(e.Type)),
+		xlog.Str("topic", e.Topic),
+		xlog.Str("group", e.Group),
+		xlog.Str("message_id", e.MessageID),
+		xlog.Str("event_name", e.EventName),
+	)
+	switch e.Type {
+	case EventError, EventNack:
+		ev.Warn().Err(e.Err).Msg("xbus event")
+	default:
+		if e.Duration > 0 {
+			ev = ev.With(xlog.Dur("duration", e.Duration))
+		}
+		ev.Debug().Msg("xbus event")
+	}
+}

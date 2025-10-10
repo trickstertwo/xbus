@@ -3,7 +3,6 @@ package redisstream
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -16,6 +15,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/trickstertwo/xbus"
+	"github.com/trickstertwo/xclock"
+	"github.com/trickstertwo/xlog"
 )
 
 // Adapter: Redis Streams Transport (Strategy + Adapter patterns)
@@ -23,13 +24,21 @@ import (
 const TransportName = "redis-streams"
 
 func init() {
-	// Fail fast if registration cannot be completed.
 	if err := xbus.RegisterTransport(TransportName, func(cfg map[string]any) (xbus.Transport, error) {
 		return NewTransport(ConfigFromMap(cfg))
 	}); err != nil {
 		panic(fmt.Errorf("xbus: failed to register transport %q: %w", TransportName, err))
 	}
 }
+
+// Field constants (avoid typos/allocs)
+const (
+	fieldID         = "id"
+	fieldName       = "name"
+	fieldPayload    = "payload"    // raw []byte to reduce allocs (no base64)
+	fieldProducedAt = "producedAt" // int64 ns
+	fieldMetaPrefix = "meta:"
+)
 
 // Config for Redis Streams transport.
 type Config struct {
@@ -39,25 +48,50 @@ type Config struct {
 	Password      string
 	DB            int
 	TLS           bool
-	TLSServerName string // optional SNI if TLS is enabled
+	TLSServerName string
 
 	// Consumer options
 	Group       string
 	Consumer    string
-	Concurrency int           // number of concurrent handler workers
-	BatchSize   int           // XREADGROUP COUNT
-	Block       time.Duration // XREADGROUP BLOCK
-	AutoCreate  bool          // auto-create consumer group if missing
+	Concurrency int
+	BatchSize   int
+	Block       time.Duration
+	AutoCreate  bool
 
 	// Acknowledgment & stream trimming
-	AutoDeleteOnAck bool   // whether to XDEL after XACK
-	DeadLetter      string // optional dead-letter stream
-	MaxLenApprox    int64  // XADD MAXLEN ~ approx; 0 disables trimming
+	AutoDeleteOnAck bool
+	DeadLetter      string
+	MaxLenApprox    int64
 
 	// Pending entries recovery (optional)
-	ClaimMinIdle  time.Duration // only claim messages idle for at least this duration; 0 disables claim loop
-	ClaimBatch    int           // number of PEL entries to claim per round
-	ClaimInterval time.Duration // interval for claim loop
+	ClaimMinIdle  time.Duration
+	ClaimBatch    int
+	ClaimInterval time.Duration
+}
+
+// toMap converts typed Config into the generic map expected by the transport factory.
+func (c Config) toMap() map[string]any {
+	m := map[string]any{
+		"addr":               c.Addr,
+		"username":           c.Username,
+		"password":           c.Password,
+		"db":                 c.DB,
+		"tls":                c.TLS,
+		"tls_server_name":    c.TLSServerName,
+		"group":              c.Group,
+		"consumer":           c.Consumer,
+		"concurrency":        c.Concurrency,
+		"batch_size":         c.BatchSize,
+		"block":              c.Block,
+		"auto_create":        c.AutoCreate,
+		"auto_delete_on_ack": c.AutoDeleteOnAck,
+		"dead_letter":        c.DeadLetter,
+		"max_len_approx":     c.MaxLenApprox,
+		"claim_min_idle":     c.ClaimMinIdle,
+		"claim_batch":        c.ClaimBatch,
+		"claim_interval":     c.ClaimInterval,
+	}
+	return m
 }
 
 // ConfigFromMap safely converts cfg into Config with defaults.
@@ -109,7 +143,6 @@ func ConfigFromMap(cfg map[string]any) Config {
 				return p
 			}
 		case float64:
-			// Allow raw nanoseconds if provided numerically
 			return time.Duration(v)
 		}
 		return d
@@ -126,7 +159,7 @@ func ConfigFromMap(cfg map[string]any) Config {
 		Password:      getString("password", ""),
 		DB:            getInt("db", 0),
 		TLS:           getBool("tls", false),
-		TLSServerName: getString("tls_server_name", ""), // optional
+		TLSServerName: getString("tls_server_name", ""),
 
 		Group:       getString("group", "xbus"),
 		Consumer:    getString("consumer", fmt.Sprintf("xbus-%s-%d", hostname, os.Getpid())),
@@ -145,12 +178,69 @@ func ConfigFromMap(cfg map[string]any) Config {
 	}
 }
 
+// Option configures the xbus.Bus construction when calling Use.
+type Option func(*xbus.BusBuilder)
+
+// WithLogger injects a custom xlog logger.
+func WithLogger(l *xlog.Logger) Option {
+	return func(b *xbus.BusBuilder) { b.WithLogger(l) }
+}
+
+// WithClock injects a custom xclock clock.
+func WithClock(c xclock.Clock) Option {
+	return func(b *xbus.BusBuilder) { b.WithClock(c) }
+}
+
+// WithCodec selects a codec by name (default: json).
+func WithCodec(name string) Option {
+	return func(b *xbus.BusBuilder) { b.WithCodec(name) }
+}
+
+// WithMiddleware adds processing middlewares.
+func WithMiddleware(mw ...xbus.Middleware) Option {
+	return func(b *xbus.BusBuilder) { b.WithMiddleware(mw...) }
+}
+
+// WithObserver attaches observers for lifecycle events.
+func WithObserver(obs ...xbus.Observer) Option {
+	return func(b *xbus.BusBuilder) { b.WithObserver(obs...) }
+}
+
+// WithAckTimeout sets acks/nacks timeout.
+func WithAckTimeout(d time.Duration) Option {
+	return func(b *xbus.BusBuilder) { b.WithAckTimeout(d) }
+}
+
+// Use builds and sets the default xbus.Bus using Redis Streams and returns it,
+// mirroring xlog/zerolog.Use for clear, explicit initialization.
+//
+// It fails fast by panicking if construction fails (production-friendly when
+// transport must be available at startup).
+func Use(cfg Config, opts ...Option) *xbus.Bus {
+	bus, err := xbus.Default(func(b *xbus.BusBuilder) {
+		// Prefer typed config; internally go through the factory with a map to avoid extra coupling.
+		b.WithTransport(TransportName, cfg.toMap())
+		for _, o := range opts {
+			if o != nil {
+				o(b)
+			}
+		}
+	})
+	if err != nil {
+		panic(fmt.Errorf("redisstream.Use: %w", err))
+	}
+	return bus
+}
+
 type transport struct {
 	cfg    Config
 	client *redis.Client
 
 	closeOnce sync.Once
 	closed    chan struct{}
+
+	// delivery pool to reduce per-message allocations
+	dpool sync.Pool
 }
 
 func NewTransport(cfg Config) (xbus.Transport, error) {
@@ -163,20 +253,23 @@ func NewTransport(cfg Config) (xbus.Transport, error) {
 	if cfg.TLS {
 		opts.TLSConfig = &tls.Config{
 			MinVersion:    tls.VersionTLS12,
-			ServerName:    cfg.TLSServerName, // empty is fine; Redis often doesn't use SNI; set when needed
+			ServerName:    cfg.TLSServerName,
 			Renegotiation: tls.RenegotiateNever,
 		}
 	}
-	// Eager dial to fail fast on misconfiguration
 	client := redis.NewClient(opts)
 	if err := ping(client); err != nil {
 		return nil, err
 	}
-	return &transport{
+	t := &transport{
 		cfg:    cfg,
 		client: client,
 		closed: make(chan struct{}),
-	}, nil
+		dpool: sync.Pool{
+			New: func() any { return new(delivery) },
+		},
+	}
+	return t, nil
 }
 
 func (t *transport) Publish(ctx context.Context, topic string, msgs ...*xbus.Message) error {
@@ -185,10 +278,24 @@ func (t *transport) Publish(ctx context.Context, topic string, msgs ...*xbus.Mes
 	}
 	pipe := t.client.Pipeline()
 	for _, m := range msgs {
+		// Pre-size map to reduce rehashing: id, name, payload, producedAt + metadata
+		vals := make(map[string]any, 4+len(m.Metadata))
+		if m.ID != "" {
+			vals[fieldID] = m.ID
+		}
+		vals[fieldName] = m.Name
+		// raw payload bytes (binary-safe, no base64)
+		vals[fieldPayload] = m.Payload
+		vals[fieldProducedAt] = m.ProducedAt.UnixNano()
+
+		for k, v := range m.Metadata {
+			vals[fieldMetaPrefix+k] = v
+		}
+
 		args := &redis.XAddArgs{
 			Stream: topic,
-			ID:     "*", // let Redis assign
-			Values: encodeMessage(m),
+			ID:     "*",
+			Values: vals,
 		}
 		if t.cfg.MaxLenApprox > 0 {
 			args.MaxLen = t.cfg.MaxLenApprox
@@ -200,41 +307,38 @@ func (t *transport) Publish(ctx context.Context, topic string, msgs ...*xbus.Mes
 	return err
 }
 
-func encodeMessage(m *xbus.Message) map[string]any {
-	values := map[string]any{
-		"id":         m.ID,
-		"name":       m.Name,
-		"payload_b":  base64.StdEncoding.EncodeToString(m.Payload),
-		"producedAt": m.ProducedAt.UnixNano(),
-	}
-	if len(m.Metadata) > 0 {
-		for k, v := range m.Metadata {
-			values["meta:"+k] = v
-		}
-	}
-	return values
-}
-
 func decodeMessage(id string, vals map[string]any) *xbus.Message {
 	msg := &xbus.Message{
 		ID:       id,
-		Name:     asString(vals["name"]),
-		Metadata: map[string]string{},
+		Metadata: nil, // lazily allocate when we find meta entries
 	}
-	if pb64 := asString(vals["payload_b"]); pb64 != "" {
-		if b, err := base64.StdEncoding.DecodeString(pb64); err == nil {
-			msg.Payload = b
+	if v, ok := vals[fieldName]; ok {
+		msg.Name = asString(v)
+	}
+	if v, ok := vals[fieldPayload]; ok {
+		switch p := v.(type) {
+		case []byte:
+			msg.Payload = p
+		case string:
+			msg.Payload = []byte(p)
 		}
 	}
-	if pa := vals["producedAt"]; pa != nil {
+	if pa := vals[fieldProducedAt]; pa != nil {
 		if ns, ok := toInt64(pa); ok && ns > 0 {
 			msg.ProducedAt = time.Unix(0, ns)
 		}
 	}
 	for k, v := range vals {
-		if strings.HasPrefix(k, "meta:") {
-			msg.Metadata[strings.TrimPrefix(k, "meta:")] = asString(v)
+		if strings.HasPrefix(k, fieldMetaPrefix) {
+			if msg.Metadata == nil {
+				// Pre-size capacity heuristically (a handful of items)
+				msg.Metadata = make(map[string]string, 4)
+			}
+			msg.Metadata[strings.TrimPrefix(k, fieldMetaPrefix)] = asString(v)
 		}
+	}
+	if msg.Metadata == nil {
+		msg.Metadata = map[string]string{}
 	}
 	return msg
 }
@@ -267,7 +371,6 @@ func toInt64(v any) (int64, bool) {
 		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
 			return i, true
 		}
-		// Some RESP decoders may send float-ish
 		if f, err := strconv.ParseFloat(n, 64); err == nil {
 			return int64(f), true
 		}
@@ -289,10 +392,12 @@ func (s *subscription) Close() error {
 }
 
 func (t *transport) Subscribe(ctx context.Context, topic, group string, handler func(xbus.Delivery)) (xbus.Subscription, error) {
-	// Ensure group exists if autovivify.
+	// Ensure group exists if requested.
 	if t.cfg.AutoCreate {
-		// "$" starts from new messages; "0" from beginning. We use "$" for new message consumption.
-		_ = t.client.XGroupCreateMkStream(ctx, topic, group, "$").Err()
+		// "$" starts from new messages; ignore BUSYGROUP errors.
+		if err := t.client.XGroupCreateMkStream(ctx, topic, group, "$").Err(); err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+			// Continue even on error; group may already exist or be created concurrently.
+		}
 	}
 
 	innerCtx, cancel := context.WithCancel(ctx)
@@ -303,7 +408,7 @@ func (t *transport) Subscribe(ctx context.Context, topic, group string, handler 
 	if workers < 1 {
 		workers = 1
 	}
-	workCh := make(chan *delivery, workers*2)
+	workCh := make(chan xbus.Delivery, workers*2)
 
 	// workers
 	for i := 0; i < workers; i++ {
@@ -312,6 +417,10 @@ func (t *transport) Subscribe(ctx context.Context, topic, group string, handler 
 			defer wg.Done()
 			for d := range workCh {
 				handler(d)
+				// Return delivery object to pool when our concrete type
+				if md, ok := d.(*delivery); ok {
+					t.releaseDelivery(md)
+				}
 			}
 		}()
 	}
@@ -325,6 +434,17 @@ func (t *transport) Subscribe(ctx context.Context, topic, group string, handler 
 			close(pollerDone)
 			wg.Done()
 		}()
+
+		streams := []string{topic, ">"}
+		xArgs := &redis.XReadGroupArgs{
+			Group:    group,
+			Consumer: t.cfg.Consumer,
+			Streams:  streams,
+			Count:    int64(m(1, t.cfg.BatchSize)),
+			Block:    t.cfg.Block,
+			NoAck:    false,
+		}
+
 		for {
 			// Exit ASAP on context cancellation.
 			select {
@@ -333,16 +453,7 @@ func (t *transport) Subscribe(ctx context.Context, topic, group string, handler 
 			default:
 			}
 
-			streams := []string{topic, ">"}
-			res, err := t.client.XReadGroup(innerCtx, &redis.XReadGroupArgs{
-				Group:    group,
-				Consumer: t.cfg.Consumer,
-				Streams:  streams,
-				Count:    int64(m(1, t.cfg.BatchSize)),
-				Block:    t.cfg.Block,
-				NoAck:    false,
-			}).Result()
-
+			res, err := t.client.XReadGroup(innerCtx, xArgs).Result()
 			if err != nil {
 				if errors.Is(err, context.Canceled) || innerCtx.Err() != nil {
 					return
@@ -360,16 +471,18 @@ func (t *transport) Subscribe(ctx context.Context, topic, group string, handler 
 				continue
 			}
 
-			for _, s := range res {
-				for _, x := range s.Messages {
-					d := &delivery{
-						t:       t,
-						topic:   topic,
-						group:   group,
-						id:      x.ID,
-						msg:     decodeMessage(x.ID, x.Values),
-						onceAck: &sync.Once{},
-					}
+			for i := range res {
+				str := res[i]
+				for j := range str.Messages {
+					x := str.Messages[j]
+					d := t.newDelivery()
+					d.t = t
+					d.topic = topic
+					d.group = group
+					d.id = x.ID
+					d.msg = decodeMessage(x.ID, x.Values)
+					d.onceAck = &sync.Once{}
+
 					select {
 					case workCh <- d:
 					case <-innerCtx.Done():
@@ -380,7 +493,7 @@ func (t *transport) Subscribe(ctx context.Context, topic, group string, handler 
 		}
 	}()
 
-	// optional claim loop for stuck pending entries
+	// optional pending-claim loop
 	var claimCancel context.CancelFunc
 	if t.cfg.ClaimMinIdle > 0 && t.cfg.ClaimInterval > 0 && t.cfg.ClaimBatch > 0 {
 		var claimCtx context.Context
@@ -396,11 +509,9 @@ func (t *transport) Subscribe(ctx context.Context, topic, group string, handler 
 	return &subscription{
 		close: func() error {
 			cancel()
-			// stop claim loop if any
 			if claimCancel != nil {
 				claimCancel()
 			}
-			// wait for poller to finish and close workCh, then workers drain and exit
 			<-pollerDone
 			wg.Wait()
 			return nil
@@ -432,18 +543,16 @@ func (d *delivery) Ack(ctx context.Context) error {
 }
 
 func (d *delivery) Nack(ctx context.Context, reason error) error {
-	// Redis Streams doesn't have explicit NACK. Leaving message pending causes redelivery.
-	// Optionally forward to dead-letter and ack original to prevent poison-pill loops.
+	// Redis Streams doesn't have explicit NACK. Dead-letter optionally, then ack original to avoid poison loops.
 	if dl := d.t.cfg.DeadLetter; dl != "" {
-		values := map[string]any{
-			"orig_topic": d.topic,
-			"orig_id":    d.id,
-			"error":      fmt.Sprintf("%v", reason),
-			"name":       d.msg.Name,
-			"payload_b":  base64.StdEncoding.EncodeToString(d.msg.Payload),
-		}
+		values := make(map[string]any, 4+len(d.msg.Metadata))
+		values["orig_topic"] = d.topic
+		values["orig_id"] = d.id
+		values["error"] = fmt.Sprintf("%v", reason)
+		values[fieldName] = d.msg.Name
+		values[fieldPayload] = d.msg.Payload
 		for k, v := range d.msg.Metadata {
-			values["meta:"+k] = v
+			values[fieldMetaPrefix+k] = v
 		}
 		_ = d.t.client.XAdd(ctx, &redis.XAddArgs{
 			Stream: dl,
@@ -453,11 +562,35 @@ func (d *delivery) Nack(ctx context.Context, reason error) error {
 		// acknowledge original to avoid infinite retry on poison message
 		return d.Ack(ctx)
 	}
-	// No-op (leave pending) to allow subsequent delivery via pending processing policies.
+	// Leave pending to allow redelivery by consumer-group policies.
 	return nil
 }
 
-func (t *transport) Close(ctx context.Context) error {
+func (t *transport) newDelivery() *delivery {
+	d := t.dpool.Get().(*delivery)
+	// zero the struct fields we set
+	d.t = nil
+	d.topic = ""
+	d.group = ""
+	d.id = ""
+	d.msg = nil
+	if d.onceAck == nil {
+		d.onceAck = &sync.Once{}
+	} else {
+		// reset Once by replacing with a new one
+		d.onceAck = &sync.Once{}
+	}
+	return d
+}
+
+func (t *transport) releaseDelivery(d *delivery) {
+	// clear references to avoid leaks
+	d.t = nil
+	d.msg = nil
+	t.dpool.Put(d)
+}
+
+func (t *transport) Close(_ context.Context) error {
 	var err error
 	t.closeOnce.Do(func() {
 		close(t.closed)
@@ -481,7 +614,6 @@ func (t *transport) claimLoop(ctx context.Context, topic, group string) {
 		case <-ticker.C:
 		}
 
-		// fetch pending IDs (older than minIdle); we use XPENDING summary+range
 		sum, err := t.client.XPendingExt(ctx, &redis.XPendingExtArgs{
 			Stream: topic,
 			Group:  group,
@@ -501,21 +633,16 @@ func (t *transport) claimLoop(ctx context.Context, topic, group string) {
 		}
 
 		ids := make([]string, 0, len(sum))
-		for _, p := range sum {
-			ids = append(ids, p.ID)
+		for i := range sum {
+			ids = append(ids, sum[i].ID)
 		}
-		// XCLAIM to this consumer
-		claimed, err := t.client.XClaimJustID(ctx, &redis.XClaimArgs{
+		_, _ = t.client.XClaimJustID(ctx, &redis.XClaimArgs{
 			Stream:   topic,
 			Group:    group,
 			Consumer: consumer,
 			MinIdle:  minIdle,
 			Messages: ids,
 		}).Result()
-		if err != nil || len(claimed) == 0 {
-			continue
-		}
-		// Claimed messages will be delivered by XREADGROUP to this consumer in subsequent polls.
 	}
 }
 
@@ -524,7 +651,6 @@ func ping(c *redis.Client) error {
 	defer cancel()
 	res, err := c.Ping(ctx).Result()
 	if err != nil {
-		// Provide clearer error on DNS/TLS issues
 		var netErr net.Error
 		if errors.As(err, &netErr) && netErr.Timeout() {
 			return fmt.Errorf("redis ping timeout: %w", err)

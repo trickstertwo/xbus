@@ -23,6 +23,9 @@ type Bus struct {
 	observers   []Observer
 }
 
+// Codec returns the configured codec (Strategy).
+func (b *Bus) Codec() Codec { return b.codec }
+
 // Publish encodes and sends a payload to a topic as an event name.
 func (b *Bus) Publish(ctx context.Context, topic string, eventName string, payload any, meta map[string]string) error {
 	data, err := b.codec.Marshal(payload)
@@ -56,9 +59,15 @@ func (b *Bus) Subscribe(ctx context.Context, topic, group string, handler Handle
 		b.notify(BusEvent{Type: EventConsumeStart, Topic: topic, Group: group, MessageID: msg.ID, EventName: msg.Name})
 		start := b.clock.Now()
 
-		err := wh(ctx, msg)
+		// inject active codec/logger/clock for downstream decoding and observability
+		hctx := ctx
+		hctx = injectCodec(hctx, b.codec)
+		hctx = injectLogger(hctx, b.logger)
+		hctx = injectClock(hctx, b.clock)
+
+		err := wh(hctx, msg)
 		if err == nil {
-			b.ackWithTimeout(ctx, d, true, nil)
+			b.ackWithTimeout(hctx, d, true, nil)
 			b.notify(BusEvent{
 				Type:      EventConsumeDone,
 				Topic:     topic,
@@ -71,7 +80,7 @@ func (b *Bus) Subscribe(ctx context.Context, topic, group string, handler Handle
 			return
 		}
 
-		b.ackWithTimeout(ctx, d, false, err)
+		b.ackWithTimeout(hctx, d, false, err)
 		b.notify(BusEvent{
 			Type:      EventConsumeDone,
 			Topic:     topic,
@@ -94,10 +103,20 @@ func (b *Bus) ackWithTimeout(ctx context.Context, d Delivery, ack bool, reason e
 	defer cancel()
 
 	if ack {
-		_ = d.Ack(actx)
+		if err := d.Ack(actx); err != nil {
+			b.notify(BusEvent{Type: EventError, Err: err})
+			if lg, ok := LoggerFromContext(ctx); ok && lg != nil {
+				lg.Warn().Err(err).Msg("xbus ack failed")
+			}
+		}
 		return
 	}
-	_ = d.Nack(actx, reason)
+	if err := d.Nack(actx, reason); err != nil {
+		b.notify(BusEvent{Type: EventError, Err: err})
+		if lg, ok := LoggerFromContext(ctx); ok && lg != nil {
+			lg.Warn().Err(err).Msg("xbus nack failed")
+		}
+	}
 }
 
 // Close releases underlying resources.
@@ -129,12 +148,16 @@ func (b *Bus) notify(e BusEvent) {
 type BusBuilder struct {
 	transportName string
 	transportCfg  map[string]any
-	codecName     string
-	middlewares   []Middleware
-	observers     []Observer
-	logger        *xlog.Logger
-	clock         xclock.Clock
-	ackTimeout    time.Duration
+	transportInst Transport
+
+	codecName string
+	codecInst Codec
+
+	middlewares []Middleware
+	observers   []Observer
+	logger      *xlog.Logger
+	clock       xclock.Clock
+	ackTimeout  time.Duration
 }
 
 // NewBusBuilder returns a new builder with sensible defaults.
@@ -151,8 +174,20 @@ func (bb *BusBuilder) WithTransport(name string, cfg map[string]any) *BusBuilder
 	return bb
 }
 
+// WithTransportInstance accepts a ready Transport instance (e.g., from adapter Use()).
+func (bb *BusBuilder) WithTransportInstance(t Transport) *BusBuilder {
+	bb.transportInst = t
+	return bb
+}
+
 func (bb *BusBuilder) WithCodec(name string) *BusBuilder {
 	bb.codecName = name
+	return bb
+}
+
+// WithCodecInstance accepts a ready Codec instance.
+func (bb *BusBuilder) WithCodecInstance(c Codec) *BusBuilder {
+	bb.codecInst = c
 	return bb
 }
 
@@ -194,14 +229,31 @@ func (bb *BusBuilder) WithAckTimeout(d time.Duration) *BusBuilder {
 }
 
 func (bb *BusBuilder) Build() (*Bus, error) {
-	tr, err := NewTransport(bb.transportName, bb.transportCfg)
-	if err != nil {
-		return nil, err
+	var tr Transport
+	var err error
+
+	switch {
+	case bb.transportInst != nil:
+		tr = bb.transportInst
+	case bb.transportName != "":
+		tr, err = NewTransport(bb.transportName, bb.transportCfg)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, ErrNoTransportConfigured
 	}
-	cd, err := NewCodec(bb.codecName)
-	if err != nil {
-		return nil, err
+
+	var cd Codec
+	if bb.codecInst != nil {
+		cd = bb.codecInst
+	} else {
+		cd, err = NewCodec(bb.codecName)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	var clk xclock.Clock
 	if bb.clock != nil {
 		clk = bb.clock
@@ -224,6 +276,18 @@ func (bb *BusBuilder) Build() (*Bus, error) {
 		ackTimeout:  bb.ackTimeout,
 	}
 
+	// Attach logging observer first for dependable telemetry unless already supplied externally.
+	hasLoggingObserver := false
+	for _, o := range bb.observers {
+		if _, ok := o.(LoggingObserver); ok {
+			hasLoggingObserver = true
+			break
+		}
+	}
+	if !hasLoggingObserver && lg != nil {
+		b.AddObserver(LoggingObserver{Logger: lg})
+	}
+
 	// Attach any configured observers.
 	for _, o := range bb.observers {
 		b.AddObserver(o)
@@ -232,41 +296,78 @@ func (bb *BusBuilder) Build() (*Bus, error) {
 	return b, nil
 }
 
-// Facade: package-level singleton access for teams needing quick start.
+// Simplified construction and singleton access.
 
 var (
-	defaultBusOnce sync.Once
-	defaultBus     *Bus
-	defaultBusErr  error
+	defaultBus   *Bus
+	defaultBusMu sync.Mutex
 )
 
-// InitDefaultBus initializes the global bus once (Singleton).
-func InitDefaultBus(init func(b *BusBuilder)) error {
-	defaultBusOnce.Do(func() {
-		b := NewBusBuilder()
-		if init != nil {
-			init(b)
-		}
-		defaultBus, defaultBusErr = b.Build()
-	})
-	return defaultBusErr
+// New constructs a Bus via Builder and returns a close func for convenience.
+func New(init func(b *BusBuilder)) (*Bus, func() error, error) {
+	b := NewBusBuilder()
+	if init != nil {
+		init(b)
+	}
+	bus, err := b.Build()
+	if err != nil {
+		return nil, nil, err
+	}
+	closeFn := func() error { return bus.Close(context.Background()) }
+	return bus, closeFn, nil
 }
 
-// Default returns the global bus instance or nil if not initialized.
-func Default() *Bus { return defaultBus }
+// Default returns the process-wide singleton Bus. If it isn't initialized yet,
+// it initializes it using the optional init function (Builder + Factory).
+func Default(init func(b *BusBuilder)) (*Bus, error) {
+	defaultBusMu.Lock()
+	defer defaultBusMu.Unlock()
+
+	if defaultBus != nil {
+		return defaultBus, nil
+	}
+	b := NewBusBuilder()
+	if init != nil {
+		init(b)
+	}
+	bus, err := b.Build()
+	if err != nil {
+		return nil, err
+	}
+	defaultBus = bus
+	return defaultBus, nil
+}
+
+// ResetDefault clears the default bus (useful in tests).
+func ResetDefault() {
+	defaultBusMu.Lock()
+	defaultBus = nil
+	defaultBusMu.Unlock()
+}
 
 // Publish is the Facade that uses the default bus.
 func Publish(ctx context.Context, topic, eventName string, payload any, meta map[string]string) error {
-	if defaultBus == nil {
-		return ErrDefaultBusNotInitialized
+	b, err := Default(nil)
+	if err != nil {
+		return err
 	}
-	return defaultBus.Publish(ctx, topic, eventName, payload, meta)
+	return b.Publish(ctx, topic, eventName, payload, meta)
+}
+
+// PublishBatch is the Facade that uses the default bus for batch publishing.
+func PublishBatch(ctx context.Context, topic string, events ...PublishEvent) error {
+	b, err := Default(nil)
+	if err != nil {
+		return err
+	}
+	return b.PublishBatch(ctx, topic, events...)
 }
 
 // Subscribe is the Facade that uses the default bus.
 func Subscribe(ctx context.Context, topic, group string, handler Handler) (Subscription, error) {
-	if defaultBus == nil {
-		return nil, ErrDefaultBusNotInitialized
+	b, err := Default(nil)
+	if err != nil {
+		return nil, err
 	}
-	return defaultBus.Subscribe(ctx, topic, group, handler)
+	return b.Subscribe(ctx, topic, group, handler)
 }

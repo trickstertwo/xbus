@@ -4,16 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 )
 
 // RetryConfig controls retry behavior for processing middleware.
 type RetryConfig struct {
+	// MaxAttempts is the total number of attempts including the first execution.
 	MaxAttempts int
-	Backoff     func(attempt int) time.Duration // e.g., exponential backoff
+	// Backoff computes the base wait before the next attempt (e.g., exponential backoff).
+	Backoff func(attempt int) time.Duration
+	// RetryIf, when provided, returns true if the error should be retried.
+	// If nil, all errors are retried (bounded by MaxAttempts).
+	RetryIf func(err error) bool
+	// Jitter adds up to [0, Jitter] random delay to the base backoff to avoid thundering herds.
+	Jitter time.Duration
 }
 
-// RetryMiddleware provides bounded retries around a handler.
+// RetryMiddleware provides bounded, selective retries around a handler.
 func RetryMiddleware(cfg RetryConfig) Middleware {
 	return func(next Handler) Handler {
 		return func(ctx context.Context, msg *Message) error {
@@ -22,21 +30,34 @@ func RetryMiddleware(cfg RetryConfig) Middleware {
 			if attempts < 1 {
 				attempts = 1
 			}
+			shouldRetry := cfg.RetryIf
+			if shouldRetry == nil {
+				shouldRetry = func(error) bool { return true }
+			}
 			for i := 1; i <= attempts; i++ {
 				lastErr = next(ctx, msg)
 				if lastErr == nil {
 					return nil
 				}
-				// If context is canceled, break early.
+				// Stop if context is canceled or deadline exceeded.
 				if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 					return lastErr
 				}
-				// Sleep between attempts.
+				// If we won't retry, return immediately.
+				if i == attempts || !shouldRetry(lastErr) {
+					return lastErr
+				}
+				// Sleep between attempts with optional jitter.
 				if cfg.Backoff != nil {
+					wait := cfg.Backoff(i)
+					if cfg.Jitter > 0 {
+						j := time.Duration(rand.Int63n(int64(cfg.Jitter)))
+						wait += j
+					}
 					select {
 					case <-ctx.Done():
 						return lastErr
-					case <-time.After(cfg.Backoff(i)):
+					case <-time.After(wait):
 					}
 				}
 			}
@@ -60,8 +81,9 @@ func TimeoutMiddleware(d time.Duration) Middleware {
 			errCh := make(chan error, 1)
 			go func() {
 				defer func() {
-					// Prevent goroutine leak if caller returns early on timeout.
-					recover()
+					if r := recover(); r != nil {
+						errCh <- fmt.Errorf("panic recovered: %v", r)
+					}
 				}()
 				errCh <- next(tctx, msg)
 			}()

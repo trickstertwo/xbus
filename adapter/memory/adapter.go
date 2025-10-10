@@ -76,7 +76,7 @@ func ConfigFromMap(cfg map[string]any) Config {
 	}
 }
 
-type transport struct {
+type Transport struct {
 	cfg Config
 
 	mu     sync.RWMutex
@@ -85,22 +85,22 @@ type transport struct {
 	closed atomic.Bool
 }
 
-var _ xbus.Transport = (*transport)(nil)
+var _ xbus.Transport = (*Transport)(nil)
 
-func NewTransport(cfg Config) *transport {
+func NewTransport(cfg Config) *Transport {
 	if cfg.BufferSize < 1 {
 		cfg.BufferSize = 1024
 	}
 	if cfg.Concurrency < 1 {
 		cfg.Concurrency = 1
 	}
-	return &transport{
+	return &Transport{
 		cfg:    cfg,
 		topics: make(map[string]*topic),
 	}
 }
 
-func (t *transport) Publish(ctx context.Context, topic string, msgs ...*xbus.Message) error {
+func (t *Transport) Publish(ctx context.Context, topic string, msgs ...*xbus.Message) error {
 	if t.closed.Load() {
 		return errors.New("memory transport is closed")
 	}
@@ -152,7 +152,7 @@ func (t *transport) Publish(ctx context.Context, topic string, msgs ...*xbus.Mes
 	return nil
 }
 
-func (t *transport) Subscribe(ctx context.Context, topic, group string, handler func(xbus.Delivery)) (xbus.Subscription, error) {
+func (t *Transport) Subscribe(ctx context.Context, topic, group string, handler func(xbus.Delivery)) (xbus.Subscription, error) {
 	if t.closed.Load() {
 		return nil, errors.New("memory transport is closed")
 	}
@@ -201,7 +201,7 @@ func (t *transport) Subscribe(ctx context.Context, topic, group string, handler 
 	}, nil
 }
 
-func (t *transport) Close(ctx context.Context) error {
+func (t *Transport) Close(_ context.Context) error {
 	t.closed.Store(true)
 	// Do not close queues: active subscriptions may still be draining via their own contexts.
 	// Best-effort cleanup: drop topic references so further Publishes fail early due to closed flag.
@@ -233,7 +233,7 @@ type group struct {
 }
 
 type deliveryTask struct {
-	tr    *transport
+	tr    *Transport
 	topic string
 	group *group
 	msg   *xbus.Message
@@ -247,14 +247,14 @@ type memDelivery struct {
 
 func (d *memDelivery) Message() *xbus.Message { return d.task.msg }
 
-func (d *memDelivery) Ack(ctx context.Context) error {
+func (d *memDelivery) Ack(_ context.Context) error {
 	d.ackOnce.Do(func() {
 		d.acked = true
 	})
 	return nil
 }
 
-func (d *memDelivery) Nack(ctx context.Context, reason error) error {
+func (d *memDelivery) Nack(ctx context.Context, _ error) error {
 	d.ackOnce.Do(func() {
 		// Re-enqueue for redelivery after configured delay.
 		delay := d.task.tr.cfg.RedeliveryDelay
@@ -283,7 +283,7 @@ func (d *memDelivery) Nack(ctx context.Context, reason error) error {
 	return nil
 }
 
-func (t *transport) ensureTopic(name string) *topic {
+func (t *Transport) ensureTopic(name string) *topic {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if tp, ok := t.topics[name]; ok {
