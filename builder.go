@@ -296,8 +296,6 @@ func (bb *BusBuilder) Build() (*Bus, error) {
 	return b, nil
 }
 
-// Simplified construction and singleton access.
-
 var (
 	defaultBus   *Bus
 	defaultBusMu sync.Mutex
