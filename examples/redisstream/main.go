@@ -10,6 +10,7 @@ import (
 
 	"github.com/trickstertwo/xbus"
 	"github.com/trickstertwo/xbus/adapter/redisstream"
+	"github.com/trickstertwo/xclock"
 	"github.com/trickstertwo/xlog"
 	"github.com/trickstertwo/xlog/adapter/zerolog"
 )
@@ -57,6 +58,8 @@ func main() {
 		},
 		redisstream.WithLogger(logger),
 		redisstream.WithAckTimeout(5*time.Second),
+		redisstream.WithCodec("json"),
+		redisstream.WithClock(xclock.Default()),
 		redisstream.WithMiddleware(
 			xbus.TimeoutMiddleware(15*time.Second),
 			xbus.RetryMiddleware(xbus.RetryConfig{
