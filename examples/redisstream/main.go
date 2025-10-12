@@ -42,7 +42,7 @@ func main() {
 	}).With(xlog.Str("app", "xbus-redis-example"))
 
 	// Build and set the default bus via adapter.Use pattern.
-	_ = redisstream.Use(
+	redisstream.Use(
 		redisstream.Config{
 			Addr:            env("REDIS_ADDR", "51.255.76.232:63739"),
 			Password:        env("REDIS_PASSWORD", "4a1o42U_4zpyUu"),
@@ -96,7 +96,7 @@ func main() {
 
 	// Producer
 	go func() {
-		for i := 0; i < 1_000_000; i++ {
+		for i := 0; i < 100_000; i++ {
 			evt := OrderCreated{
 				OrderID:   fmt.Sprintf("ord-%06d", i+1),
 				UserID:    fmt.Sprintf("u-%02d", (i%5)+1),

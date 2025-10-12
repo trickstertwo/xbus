@@ -30,11 +30,11 @@ func (b *Bus) PublishBatch(ctx context.Context, topic string, events ...PublishE
 	}
 
 	for i := range msgs {
-		b.notify(BusEvent{Type: EventPublishStart, Topic: topic, EventName: msgs[i].Name})
+		b.notify(Event{Type: PublishStart, Topic: topic, EventName: msgs[i].Name})
 	}
 	err := b.transport.Publish(ctx, topic, msgs...)
 	for i := range msgs {
-		b.notify(BusEvent{Type: EventPublishDone, Topic: topic, EventName: msgs[i].Name, Err: err})
+		b.notify(Event{Type: PublishDone, Topic: topic, EventName: msgs[i].Name, Err: err})
 	}
 	return err
 }

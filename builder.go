@@ -41,9 +41,9 @@ func (b *Bus) Publish(ctx context.Context, topic string, eventName string, paylo
 	}
 
 	start := b.clock.Now()
-	b.notify(BusEvent{Type: EventPublishStart, Topic: topic, EventName: eventName})
+	b.notify(Event{Type: PublishStart, Topic: topic, EventName: eventName})
 	err = b.transport.Publish(ctx, topic, msg)
-	b.notify(BusEvent{Type: EventPublishDone, Topic: topic, EventName: eventName, Duration: b.clock.Since(start), Err: err})
+	b.notify(Event{Type: PublishDone, Topic: topic, EventName: eventName, Duration: b.clock.Since(start), Err: err})
 	return err
 }
 
@@ -56,7 +56,7 @@ func (b *Bus) Subscribe(ctx context.Context, topic, group string, handler Handle
 
 	return b.transport.Subscribe(ctx, topic, group, func(d Delivery) {
 		msg := d.Message()
-		b.notify(BusEvent{Type: EventConsumeStart, Topic: topic, Group: group, MessageID: msg.ID, EventName: msg.Name})
+		b.notify(Event{Type: ConsumeStart, Topic: topic, Group: group, MessageID: msg.ID, EventName: msg.Name})
 		start := b.clock.Now()
 
 		// inject active codec/logger/clock for downstream decoding and observability
@@ -68,21 +68,21 @@ func (b *Bus) Subscribe(ctx context.Context, topic, group string, handler Handle
 		err := wh(hctx, msg)
 		if err == nil {
 			b.ackWithTimeout(hctx, d, true, nil)
-			b.notify(BusEvent{
-				Type:      EventConsumeDone,
+			b.notify(Event{
+				Type:      ConsumeDone,
 				Topic:     topic,
 				Group:     group,
 				MessageID: msg.ID,
 				EventName: msg.Name,
 				Duration:  b.clock.Since(start),
 			})
-			b.notify(BusEvent{Type: EventAck, Topic: topic, Group: group, MessageID: msg.ID, EventName: msg.Name})
+			b.notify(Event{Type: Ack, Topic: topic, Group: group, MessageID: msg.ID, EventName: msg.Name})
 			return
 		}
 
 		b.ackWithTimeout(hctx, d, false, err)
-		b.notify(BusEvent{
-			Type:      EventConsumeDone,
+		b.notify(Event{
+			Type:      ConsumeDone,
 			Topic:     topic,
 			Group:     group,
 			MessageID: msg.ID,
@@ -90,7 +90,7 @@ func (b *Bus) Subscribe(ctx context.Context, topic, group string, handler Handle
 			Duration:  b.clock.Since(start),
 			Err:       err,
 		})
-		b.notify(BusEvent{Type: EventNack, Topic: topic, Group: group, MessageID: msg.ID, EventName: msg.Name, Err: err})
+		b.notify(Event{Type: Nack, Topic: topic, Group: group, MessageID: msg.ID, EventName: msg.Name, Err: err})
 	})
 }
 
@@ -104,7 +104,7 @@ func (b *Bus) ackWithTimeout(ctx context.Context, d Delivery, ack bool, reason e
 
 	if ack {
 		if err := d.Ack(actx); err != nil {
-			b.notify(BusEvent{Type: EventError, Err: err})
+			b.notify(Event{Type: Error, Err: err})
 			if lg, ok := LoggerFromContext(ctx); ok && lg != nil {
 				lg.Warn().Err(err).Msg("xbus ack failed")
 			}
@@ -112,7 +112,7 @@ func (b *Bus) ackWithTimeout(ctx context.Context, d Delivery, ack bool, reason e
 		return
 	}
 	if err := d.Nack(actx, reason); err != nil {
-		b.notify(BusEvent{Type: EventError, Err: err})
+		b.notify(Event{Type: Error, Err: err})
 		if lg, ok := LoggerFromContext(ctx); ok && lg != nil {
 			lg.Warn().Err(err).Msg("xbus nack failed")
 		}
@@ -134,13 +134,13 @@ func (b *Bus) AddObserver(obs Observer) {
 	b.observersMu.Unlock()
 }
 
-func (b *Bus) notify(e BusEvent) {
+func (b *Bus) notify(e Event) {
 	b.observersMu.RLock()
 	obs := make([]Observer, len(b.observers))
 	copy(obs, b.observers)
 	b.observersMu.RUnlock()
 	for _, o := range obs {
-		o.OnBusEvent(e)
+		o.OnEvent(e)
 	}
 }
 
@@ -334,13 +334,6 @@ func Default(init func(b *BusBuilder)) (*Bus, error) {
 	}
 	defaultBus = bus
 	return defaultBus, nil
-}
-
-// ResetDefault clears the default bus (useful in tests).
-func ResetDefault() {
-	defaultBusMu.Lock()
-	defaultBus = nil
-	defaultBusMu.Unlock()
 }
 
 // Publish is the Facade that uses the default bus.
