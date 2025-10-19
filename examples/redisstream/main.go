@@ -42,7 +42,7 @@ func main() {
 	}).With(xlog.Str("app", "xbus-redis-example"))
 
 	// Build and set the default bus via adapter.Use pattern.
-	redisstream.Use(
+	_ = redisstream.Use(
 		redisstream.Config{
 			Addr:            env("REDIS_ADDR", "51.255.76.232:63739"),
 			Password:        env("REDIS_PASSWORD", "4a1o42U_4zpyUu"),

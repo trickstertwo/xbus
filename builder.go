@@ -276,18 +276,6 @@ func (bb *BusBuilder) Build() (*Bus, error) {
 		ackTimeout:  bb.ackTimeout,
 	}
 
-	// Attach logging observer first for dependable telemetry unless already supplied externally.
-	hasLoggingObserver := false
-	for _, o := range bb.observers {
-		if _, ok := o.(LoggingObserver); ok {
-			hasLoggingObserver = true
-			break
-		}
-	}
-	if !hasLoggingObserver && lg != nil {
-		b.AddObserver(LoggingObserver{Logger: lg})
-	}
-
 	// Attach any configured observers.
 	for _, o := range bb.observers {
 		b.AddObserver(o)
@@ -300,20 +288,6 @@ var (
 	defaultBus   *Bus
 	defaultBusMu sync.Mutex
 )
-
-// New constructs a Bus via Builder and returns a close func for convenience.
-func New(init func(b *BusBuilder)) (*Bus, func() error, error) {
-	b := NewBusBuilder()
-	if init != nil {
-		init(b)
-	}
-	bus, err := b.Build()
-	if err != nil {
-		return nil, nil, err
-	}
-	closeFn := func() error { return bus.Close(context.Background()) }
-	return bus, closeFn, nil
-}
 
 // Default returns the process-wide singleton Bus. If it isn't initialized yet,
 // it initializes it using the optional init function (Builder + Factory).
