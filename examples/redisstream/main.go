@@ -107,7 +107,7 @@ func main() {
 				"iter":   fmt.Sprint(i + 1),
 			}); err != nil {
 				logger.Warn().Err(err).Msg("publish failed")
-				time.Sleep(250 * time.Millisecond)
+				time.Sleep(1 * time.Millisecond)
 			}
 		}
 	}()

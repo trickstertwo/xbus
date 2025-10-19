@@ -18,23 +18,23 @@ func init() {
 	}
 }
 
-// Use builds and sets the default xbus.Bus using Redis Streams and returns it,
-// mirroring xlog/zerolog.Use for clear, explicit initialization.
-//
-// It fails fast by panicking if construction fails (production-friendly when
-// transport must be available at startup).
+// Use builds a Bus with Redis Streams and sets it as the default Bus, then returns it.
+// Mirrors xlog/xclock "Use" behavior: explicit construction and global install.
 func Use(cfg Config, opts ...Option) *xbus.Bus {
-	bus, err := xbus.Default(func(b *xbus.BusBuilder) {
-		// Prefer typed config; internally go through the factory with a map to avoid extra coupling.
-		b.WithTransport(TransportName, cfg.toMap())
-		for _, o := range opts {
-			if o != nil {
-				o(b)
-			}
+	bb := xbus.NewBusBuilder().
+		WithTransport(TransportName, cfg.toMap())
+
+	for _, o := range opts {
+		if o != nil {
+			o(bb)
 		}
-	})
+	}
+	bus, err := bb.Build()
 	if err != nil {
 		panic(fmt.Errorf("redisstream.Use: %w", err))
 	}
+
+	// Install as process-wide default (replaces any existing default).
+	xbus.SetDefault(bus)
 	return bus
 }
