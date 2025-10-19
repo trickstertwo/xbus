@@ -116,9 +116,7 @@ func main() {
 	<-ctx.Done()
 
 	// Close default bus on shutdown.
-	if b, err := xbus.Default(nil); err == nil && b != nil {
-		_ = b.Close(context.Background())
-	}
+	_ = xbus.Default().Close(context.Background())
 }
 
 func env(key, def string) string {

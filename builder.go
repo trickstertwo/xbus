@@ -291,48 +291,33 @@ var (
 
 // Default returns the process-wide singleton Bus. If it isn't initialized yet,
 // it initializes it using the optional init function (Builder + Factory).
-func Default(init func(b *BusBuilder)) (*Bus, error) {
+func Default() *Bus {
 	defaultBusMu.Lock()
 	defer defaultBusMu.Unlock()
 
 	if defaultBus != nil {
-		return defaultBus, nil
+		return defaultBus
 	}
 	b := NewBusBuilder()
-	if init != nil {
-		init(b)
-	}
 	bus, err := b.Build()
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 	defaultBus = bus
-	return defaultBus, nil
+	return defaultBus
 }
 
 // Publish is the Facade that uses the default bus.
 func Publish(ctx context.Context, topic, eventName string, payload any, meta map[string]string) error {
-	b, err := Default(nil)
-	if err != nil {
-		return err
-	}
-	return b.Publish(ctx, topic, eventName, payload, meta)
+	return Default().Publish(ctx, topic, eventName, payload, meta)
 }
 
 // PublishBatch is the Facade that uses the default bus for batch publishing.
 func PublishBatch(ctx context.Context, topic string, events ...PublishEvent) error {
-	b, err := Default(nil)
-	if err != nil {
-		return err
-	}
-	return b.PublishBatch(ctx, topic, events...)
+	return Default().PublishBatch(ctx, topic, events...)
 }
 
 // Subscribe is the Facade that uses the default bus.
 func Subscribe(ctx context.Context, topic, group string, handler Handler) (Subscription, error) {
-	b, err := Default(nil)
-	if err != nil {
-		return nil, err
-	}
-	return b.Subscribe(ctx, topic, group, handler)
+	return Default().Subscribe(ctx, topic, group, handler)
 }
