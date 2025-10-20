@@ -7,11 +7,32 @@ import (
 	"github.com/trickstertwo/xlog"
 )
 
-// Reuse ctxKey from codec.go within the same package.
+// ctxKey is the base for all context keys in xbus (prevents collisions).
+type ctxKey string
+
 const (
+	codecCtxKey  ctxKey = "xbus:codec"
 	loggerCtxKey ctxKey = "xbus:logger"
 	clockCtxKey  ctxKey = "xbus:clock"
 )
+
+// injectCodec attaches the active Codec into context for downstream handlers.
+func injectCodec(ctx context.Context, c Codec) context.Context {
+	if c == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, codecCtxKey, c)
+}
+
+// CodecFromContext retrieves a Codec previously injected into the context.
+func CodecFromContext(ctx context.Context) (Codec, bool) {
+	if v := ctx.Value(codecCtxKey); v != nil {
+		if c, ok := v.(Codec); ok && c != nil {
+			return c, true
+		}
+	}
+	return nil, false
+}
 
 func injectLogger(ctx context.Context, l *xlog.Logger) context.Context {
 	if l == nil {
@@ -43,4 +64,12 @@ func ClockFromContext(ctx context.Context) (xclock.Clock, bool) {
 		}
 	}
 	return nil, false
+}
+
+// InjectAll is a convenience helper to inject all standard dependencies.
+func InjectAll(ctx context.Context, codec Codec, logger *xlog.Logger, clock xclock.Clock) context.Context {
+	ctx = injectCodec(ctx, codec)
+	ctx = injectLogger(ctx, logger)
+	ctx = injectClock(ctx, clock)
+	return ctx
 }
