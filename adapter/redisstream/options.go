@@ -8,15 +8,15 @@ import (
 	"github.com/trickstertwo/xlog"
 )
 
-// Option configures the xbus.Bus when using redisstream.Use().
+// Option configures xbus.Bus when using Use().
 type Option func(*xbus.BusBuilder)
 
-// WithLogger injects a custom xlog logger.
+// WithLogger injects a custom logger.
 func WithLogger(l *xlog.Logger) Option {
 	return func(b *xbus.BusBuilder) { b.WithLogger(l) }
 }
 
-// WithClock injects a custom xclock clock.
+// WithClock injects a custom clock.
 func WithClock(c xclock.Clock) Option {
 	return func(b *xbus.BusBuilder) { b.WithClock(c) }
 }
@@ -26,22 +26,22 @@ func WithCodec(name string) Option {
 	return func(b *xbus.BusBuilder) { b.WithCodec(name) }
 }
 
-// WithMiddleware adds processing middlewares (retry, timeout, etc).
+// WithMiddleware adds processing middlewares.
 func WithMiddleware(mw ...xbus.Middleware) Option {
 	return func(b *xbus.BusBuilder) { b.WithMiddleware(mw...) }
 }
 
-// WithAckTimeout sets acks/nacks timeout (default: 5s).
+// WithAckTimeout sets ack/nack timeout.
 func WithAckTimeout(d time.Duration) Option {
 	return func(b *xbus.BusBuilder) { b.WithAckTimeout(d) }
 }
 
-// WithObserver attaches observers for lifecycle events.
+// WithObserver attaches lifecycle event observers.
 func WithObserver(obs ...xbus.Observer) Option {
 	return func(b *xbus.BusBuilder) { b.WithObserver(obs...) }
 }
 
-// WithObserverPool configures async observer pool for non-blocking notifications.
+// WithObserverPool configures the async observer pool.
 func WithObserverPool(workers, bufferSize int) Option {
 	return func(b *xbus.BusBuilder) { b.WithObserverPool(workers, bufferSize) }
 }
