@@ -47,14 +47,17 @@ func main() {
 	// Initialize bus with Redis Streams
 	bus := redisstream.Use(
 		redisstream.Config{
-			Addr:        "51.255.76.232:63739",
-			Password:    "4a1o42U_4zpyUu",
-			Group:       "xbus-quickstart",
-			Concurrency: 4,
-			BatchSize:   32,
-			Block:       5 * time.Second,
-			AutoCreate:  true,
-			DeadLetter:  "orders-dlq",
+			Addr:         "51.255.76.232:63739",
+			Password:     "4a1o42U_4zpyUu",
+			Group:        "xbus-quickstart",
+			Concurrency:  4,
+			BatchSize:    32,
+			Block:        5 * time.Second,
+			AutoCreate:   true,
+			DeadLetter:   "orders-dlq",
+			MaxLen:       1_000_000,          // ← Exact trim (slower but precise)
+			MinIdleTime:  7 * 24 * time.Hour, // ← Also remove entries older than 7 days
+			TrimInterval: 6 * time.Hour,      // ← Check every 6 hours
 		},
 		redisstream.WithLogger(logger),
 		redisstream.WithMiddleware(

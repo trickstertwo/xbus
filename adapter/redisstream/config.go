@@ -27,7 +27,12 @@ type Config struct {
 	// Stream management
 	AutoDeleteOnAck bool
 	DeadLetter      string
-	MaxLenApprox    int64
+
+	// Stream trimming (retention policy)
+	MaxLen       int64         // Hard limit on stream length (XADD MAXLEN)
+	MaxLenApprox int64         // Approximate limit (faster, use ~)
+	MinIdleTime  time.Duration // Remove entries older than this duration
+	TrimInterval time.Duration // How often to trim (if not trimming on every XADD)
 
 	// Pending entry recovery (automatic crash recovery)
 	ClaimMinIdle  time.Duration
@@ -53,8 +58,13 @@ func Defaults() Config {
 		Block:           5 * time.Second,
 		AutoCreate:      true,
 		AutoDeleteOnAck: false,
-		ClaimBatch:      128,
-		ClaimInterval:   15 * time.Second,
+
+		// Default: Keep last 1M entries (reasonable for most use cases)
+		MaxLenApprox: 1_000_000,
+		TrimInterval: 0, // Trim on every XADD (safest, minimal overhead with APPROX)
+
+		ClaimBatch:    128,
+		ClaimInterval: 15 * time.Second,
 	}
 }
 
@@ -77,6 +87,12 @@ func (c Config) Validate() error {
 	}
 	if c.Block <= 0 {
 		return fmt.Errorf("config: block must be > 0, got %v", c.Block)
+	}
+	if c.MaxLen > 0 && c.MaxLenApprox > 0 {
+		return fmt.Errorf("config: cannot set both max_len (hard) and max_len_approx (soft)")
+	}
+	if c.TrimInterval < 0 {
+		return fmt.Errorf("config: trim_interval must be >= 0")
 	}
 	if c.ClaimMinIdle > 0 && c.ClaimInterval <= 0 {
 		return fmt.Errorf("config: claim_interval must be > 0 if claim_min_idle is set")
@@ -101,7 +117,10 @@ func (c Config) toMap() map[string]any {
 		"auto_create":        c.AutoCreate,
 		"auto_delete_on_ack": c.AutoDeleteOnAck,
 		"dead_letter":        c.DeadLetter,
+		"max_len":            c.MaxLen,
 		"max_len_approx":     c.MaxLenApprox,
+		"min_idle_time":      c.MinIdleTime,
+		"trim_interval":      c.TrimInterval,
 		"claim_min_idle":     c.ClaimMinIdle,
 		"claim_batch":        c.ClaimBatch,
 		"claim_interval":     c.ClaimInterval,
@@ -154,8 +173,17 @@ func ConfigFromMap(m map[string]any) Config {
 	if v, ok := m["dead_letter"].(string); ok {
 		c.DeadLetter = v
 	}
+	if v, ok := m["max_len"].(int64); ok && v > 0 {
+		c.MaxLen = v
+	}
 	if v, ok := m["max_len_approx"].(int64); ok && v > 0 {
 		c.MaxLenApprox = v
+	}
+	if v, ok := m["min_idle_time"].(time.Duration); ok {
+		c.MinIdleTime = v
+	}
+	if v, ok := m["trim_interval"].(time.Duration); ok {
+		c.TrimInterval = v
 	}
 	if v, ok := m["claim_min_idle"].(time.Duration); ok {
 		c.ClaimMinIdle = v
