@@ -1,6 +1,7 @@
-package redisstream
+package memory
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/trickstertwo/xbus"
@@ -8,7 +9,52 @@ import (
 	"github.com/trickstertwo/xlog"
 )
 
-// Option configures the xbus.Bus when using redisstream.Use().
+// Use builds a Bus with the in-memory transport and sets it as the default.
+// Mirrors redisstream.Use and xlog "Use" pattern: explicit construction with global install.
+//
+// Example:
+//
+//	bus := memory.Use(memory.Config{
+//	    BufferSize:  4096,
+//	    Concurrency: 8,
+//	    AssignIDs:   true,
+//	},
+//	    memory.WithLogger(logger),
+//	    memory.WithObserver(observer),
+//	)
+//
+// The returned bus is installed as the process-wide default.
+func Use(cfg Config, opts ...Option) *xbus.Bus {
+	bb := xbus.NewBusBuilder().
+		WithTransport(TransportName, cfg.toMap())
+
+	for _, o := range opts {
+		if o != nil {
+			o(bb)
+		}
+	}
+
+	bus, err := bb.Build()
+	if err != nil {
+		panic(fmt.Errorf("memory.Use: %w", err))
+	}
+
+	// Install as process-wide default
+	xbus.SetDefault(bus)
+	return bus
+}
+
+// toMap converts Config to the generic map expected by the transport factory.
+func (c Config) toMap() map[string]any {
+	return map[string]any{
+		"buffer_size":      c.BufferSize,
+		"concurrency":      c.Concurrency,
+		"redelivery_delay": c.RedeliveryDelay,
+		"assign_ids":       c.AssignIDs,
+	}
+}
+
+// Option configures the xbus.Bus when calling Use.
 type Option func(*xbus.BusBuilder)
 
 // WithLogger injects a custom xlog logger.

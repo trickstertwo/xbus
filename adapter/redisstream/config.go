@@ -6,36 +6,36 @@ import (
 	"time"
 )
 
-// Config for Redis Streams transport.
+// Config for Redis Streams transport with production-grade settings.
 type Config struct {
-	// Client options
-	Addr          string
-	Username      string
-	Password      string
-	DB            int
-	TLS           bool
-	TLSServerName string
+	// Redis client options
+	Addr          string // Redis address (default: 127.0.0.1:6379)
+	Username      string // Auth username (optional)
+	Password      string // Auth password (optional)
+	DB            int    // Database number (default: 0)
+	TLS           bool   // Enable TLS
+	TLSServerName string // TLS server name for verification
 
-	// Consumer options
-	Group       string
-	Consumer    string
-	Concurrency int
-	BatchSize   int
-	Block       time.Duration
-	AutoCreate  bool
+	// Consumer group options
+	Group       string        // Consumer group name (default: "xbus")
+	Consumer    string        // Consumer name (default: "xbus-{hostname}-{pid}")
+	Concurrency int           // Worker goroutines per subscription (default: 8)
+	BatchSize   int           // XREADGROUP COUNT (default: 128)
+	Block       time.Duration // XREADGROUP BLOCK duration (default: 5s)
+	AutoCreate  bool          // Auto-create group/stream (default: true)
 
-	// Acknowledgment & stream trimming
-	AutoDeleteOnAck bool
-	DeadLetter      string
-	MaxLenApprox    int64
+	// Acknowledgment and stream management
+	AutoDeleteOnAck bool   // XDEL after XACK (default: false)
+	DeadLetter      string // Dead-letter queue stream name (optional)
+	MaxLenApprox    int64  // Stream _max length trimming (default: 0, no limit)
 
-	// Pending entries recovery (optional)
-	ClaimMinIdle  time.Duration
-	ClaimBatch    int
-	ClaimInterval time.Duration
+	// Pending entry recovery (optional, for crash recovery)
+	ClaimMinIdle  time.Duration // Idle time threshold for pending claim (default: 0, disabled)
+	ClaimBatch    int           // Max entries to claim per interval (default: 128)
+	ClaimInterval time.Duration // Claim interval (default: 15s)
 }
 
-// toMap converts typed Config into the generic map expected by the transport factory.
+// toMap converts typed Config into the generic map for transport factory.
 func (c Config) toMap() map[string]any {
 	return map[string]any{
 		"addr":               c.Addr,
@@ -59,7 +59,7 @@ func (c Config) toMap() map[string]any {
 	}
 }
 
-// ConfigFromMap safely converts cfg into Config with defaults.
+// ConfigFromMap safely converts a generic map into Config with production defaults.
 func ConfigFromMap(cfg map[string]any) Config {
 	getString := func(k, d string) string {
 		if v, ok := cfg[k].(string); ok && v != "" {
@@ -67,6 +67,7 @@ func ConfigFromMap(cfg map[string]any) Config {
 		}
 		return d
 	}
+
 	getInt := func(k string, d int) int {
 		switch v := cfg[k].(type) {
 		case int:
@@ -80,6 +81,7 @@ func ConfigFromMap(cfg map[string]any) Config {
 		}
 		return d
 	}
+
 	getInt64 := func(k string, d int64) int64 {
 		switch v := cfg[k].(type) {
 		case int:
@@ -93,12 +95,14 @@ func ConfigFromMap(cfg map[string]any) Config {
 		}
 		return d
 	}
+
 	getBool := func(k string, d bool) bool {
 		if v, ok := cfg[k].(bool); ok {
 			return v
 		}
 		return d
 	}
+
 	getDur := func(k string, d time.Duration) time.Duration {
 		switch v := cfg[k].(type) {
 		case time.Duration:
@@ -113,6 +117,7 @@ func ConfigFromMap(cfg map[string]any) Config {
 		return d
 	}
 
+	// Generate default consumer name from hostname and PID
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "xbus"
@@ -126,19 +131,22 @@ func ConfigFromMap(cfg map[string]any) Config {
 		TLS:           getBool("tls", false),
 		TLSServerName: getString("tls_server_name", ""),
 
+		// Consumer group defaults (production-friendly)
 		Group:       getString("group", "xbus"),
 		Consumer:    getString("consumer", fmt.Sprintf("xbus-%s-%d", hostname, os.Getpid())),
-		Concurrency: getInt("concurrency", 8),
-		BatchSize:   getInt("batch_size", 128),
+		Concurrency: _max(1, getInt("concurrency", 8)),
+		BatchSize:   _max(1, getInt("batch_size", 128)),
 		Block:       getDur("block", 5*time.Second),
 		AutoCreate:  getBool("auto_create", true),
 
+		// Stream management
 		AutoDeleteOnAck: getBool("auto_delete_on_ack", false),
 		DeadLetter:      getString("dead_letter", ""),
 		MaxLenApprox:    getInt64("max_len_approx", 0),
 
+		// Pending entry recovery (disabled by default, enable for resilience)
 		ClaimMinIdle:  getDur("claim_min_idle", 0),
-		ClaimBatch:    getInt("claim_batch", 128),
+		ClaimBatch:    _max(1, getInt("claim_batch", 128)),
 		ClaimInterval: getDur("claim_interval", 15*time.Second),
 	}
 }

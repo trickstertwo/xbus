@@ -3,6 +3,7 @@ package xbus
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/trickstertwo/xclock"
@@ -16,22 +17,51 @@ type Bus struct {
 	clock       xclock.Clock
 	logger      *xlog.Logger
 	middlewares []Middleware
+	ackTimeout  time.Duration
 
-	ackTimeout time.Duration
+	// Async observer dispatch pool (non-blocking)
+	observerPool *ObserverPool
 
+	// Cached observers list (read-heavy path, updated rarely)
 	observersMu sync.RWMutex
 	observers   []Observer
+
+	// Pre-injected context (eliminates per-delivery context allocations)
+	baseCtx context.Context
+
+	// Metrics tracking
+	metrics *busMetrics
+}
+
+// busMetrics tracks operational telemetry (lock-free with atomics)
+type busMetrics struct {
+	publishCount atomic.Uint64
+	consumeCount atomic.Uint64
+	ackCount     atomic.Uint64
+	nackCount    atomic.Uint64
+	errorCount   atomic.Uint64
+}
+
+// PublishEvent describes a single event in a batch publish call.
+type PublishEvent struct {
+	Name    string
+	Payload any
+	Meta    map[string]string
 }
 
 // Codec returns the configured codec (Strategy).
 func (b *Bus) Codec() Codec { return b.codec }
 
 // Publish encodes and sends a payload to a topic as an event name.
+// Optimized: minimal allocations, async event notification.
 func (b *Bus) Publish(ctx context.Context, topic string, eventName string, payload any, meta map[string]string) error {
+	b.metrics.publishCount.Add(1)
+
 	data, err := b.codec.Marshal(payload)
 	if err != nil {
 		return err
 	}
+
 	msg := &Message{
 		ID:         "", // transport may assign
 		Name:       eventName,
@@ -41,34 +71,95 @@ func (b *Bus) Publish(ctx context.Context, topic string, eventName string, paylo
 	}
 
 	start := b.clock.Now()
-	b.notify(Event{Type: PublishStart, Topic: topic, EventName: eventName})
+	b.notifyAsync(Event{Type: PublishStart, Topic: topic, EventName: eventName})
+
 	err = b.transport.Publish(ctx, topic, msg)
-	b.notify(Event{Type: PublishDone, Topic: topic, EventName: eventName, Duration: b.clock.Since(start), Err: err})
+
+	b.notifyAsync(Event{
+		Type:      PublishDone,
+		Topic:     topic,
+		EventName: eventName,
+		Duration:  b.clock.Since(start),
+		Err:       err,
+	})
+	return err
+}
+
+// PublishBatch encodes and sends multiple events to a topic atomically.
+// Optimized: single batch event notification (not per-message).
+func (b *Bus) PublishBatch(ctx context.Context, topic string, events ...PublishEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	b.metrics.publishCount.Add(uint64(len(events)))
+
+	msgs := make([]*Message, 0, len(events))
+	for i := range events {
+		data, err := b.codec.Marshal(events[i].Payload)
+		if err != nil {
+			return err
+		}
+		msgs = append(msgs, &Message{
+			Name:       events[i].Name,
+			Payload:    data,
+			Metadata:   events[i].Meta,
+			ProducedAt: b.clock.Now(),
+		})
+	}
+
+	// Single batch start event (not per-message)
+	b.notifyAsync(Event{
+		Type:      PublishStart,
+		Topic:     topic,
+		EventName: "batch",
+	})
+
+	start := b.clock.Now()
+	err := b.transport.Publish(ctx, topic, msgs...)
+
+	// Single batch done event with aggregated metrics
+	b.notifyAsync(Event{
+		Type:      PublishDone,
+		Topic:     topic,
+		EventName: "batch",
+		Duration:  b.clock.Since(start),
+		Err:       err,
+	})
+
 	return err
 }
 
 // Subscribe registers a handler under a consumer group for a topic.
-// The handler will be wrapped with configured middlewares and protected by recovery.
+// Optimized: pre-injected context, async event notification.
 func (b *Bus) Subscribe(ctx context.Context, topic, group string, handler Handler) (Subscription, error) {
-	// Always enable panic recovery first for dependability.
+	// Always enable panic recovery first for dependability
 	base := RecoveryMiddleware()(handler)
 	wh := Chain(base, b.middlewares...)
 
 	return b.transport.Subscribe(ctx, topic, group, func(d Delivery) {
+		b.metrics.consumeCount.Add(1)
+
 		msg := d.Message()
-		b.notify(Event{Type: ConsumeStart, Topic: topic, Group: group, MessageID: msg.ID, EventName: msg.Name})
+
+		// Use pre-injected base context (avoids 3x context allocation per delivery)
+		hctx := b.baseCtx
+
+		b.notifyAsync(Event{
+			Type:      ConsumeStart,
+			Topic:     topic,
+			Group:     group,
+			MessageID: msg.ID,
+			EventName: msg.Name,
+		})
+
 		start := b.clock.Now()
-
-		// inject active codec/logger/clock for downstream decoding and observability
-		hctx := ctx
-		hctx = injectCodec(hctx, b.codec)
-		hctx = injectLogger(hctx, b.logger)
-		hctx = injectClock(hctx, b.clock)
-
 		err := wh(hctx, msg)
+
 		if err == nil {
+			b.metrics.ackCount.Add(1)
 			b.ackWithTimeout(hctx, d, true, nil)
-			b.notify(Event{
+			b.notifyAsync(Event{
 				Type:      ConsumeDone,
 				Topic:     topic,
 				Group:     group,
@@ -76,12 +167,19 @@ func (b *Bus) Subscribe(ctx context.Context, topic, group string, handler Handle
 				EventName: msg.Name,
 				Duration:  b.clock.Since(start),
 			})
-			b.notify(Event{Type: Ack, Topic: topic, Group: group, MessageID: msg.ID, EventName: msg.Name})
+			b.notifyAsync(Event{
+				Type:      Ack,
+				Topic:     topic,
+				Group:     group,
+				MessageID: msg.ID,
+				EventName: msg.Name,
+			})
 			return
 		}
 
+		b.metrics.nackCount.Add(1)
 		b.ackWithTimeout(hctx, d, false, err)
-		b.notify(Event{
+		b.notifyAsync(Event{
 			Type:      ConsumeDone,
 			Topic:     topic,
 			Group:     group,
@@ -90,7 +188,14 @@ func (b *Bus) Subscribe(ctx context.Context, topic, group string, handler Handle
 			Duration:  b.clock.Since(start),
 			Err:       err,
 		})
-		b.notify(Event{Type: Nack, Topic: topic, Group: group, MessageID: msg.ID, EventName: msg.Name, Err: err})
+		b.notifyAsync(Event{
+			Type:      Nack,
+			Topic:     topic,
+			Group:     group,
+			MessageID: msg.ID,
+			EventName: msg.Name,
+			Err:       err,
+		})
 	})
 }
 
@@ -104,15 +209,18 @@ func (b *Bus) ackWithTimeout(ctx context.Context, d Delivery, ack bool, reason e
 
 	if ack {
 		if err := d.Ack(actx); err != nil {
-			b.notify(Event{Type: Error, Err: err})
+			b.metrics.errorCount.Add(1)
+			b.notifyAsync(Event{Type: Error, Err: err})
 			if lg, ok := LoggerFromContext(ctx); ok && lg != nil {
 				lg.Warn().Err(err).Msg("xbus ack failed")
 			}
 		}
 		return
 	}
+
 	if err := d.Nack(actx, reason); err != nil {
-		b.notify(Event{Type: Error, Err: err})
+		b.metrics.errorCount.Add(1)
+		b.notifyAsync(Event{Type: Error, Err: err})
 		if lg, ok := LoggerFromContext(ctx); ok && lg != nil {
 			lg.Warn().Err(err).Msg("xbus nack failed")
 		}
@@ -121,6 +229,10 @@ func (b *Bus) ackWithTimeout(ctx context.Context, d Delivery, ack bool, reason e
 
 // Close releases underlying resources.
 func (b *Bus) Close(ctx context.Context) error {
+	// Gracefully shutdown observer pool
+	if b.observerPool != nil {
+		_ = b.observerPool.Close(5 * time.Second)
+	}
 	return b.transport.Close(ctx)
 }
 
@@ -134,37 +246,46 @@ func (b *Bus) AddObserver(obs Observer) {
 	b.observersMu.Unlock()
 }
 
-func (b *Bus) notify(e Event) {
+// notifyAsync dispatches events asynchronously (non-blocking).
+// Drops events if pool buffer is full to prevent blocking the publish path.
+func (b *Bus) notifyAsync(e Event) {
+	if b.observerPool == nil {
+		return // No observer pool configured
+	}
+
 	b.observersMu.RLock()
-	obs := make([]Observer, len(b.observers))
-	copy(obs, b.observers)
+	observers := make([]Observer, len(b.observers))
+	copy(observers, b.observers)
 	b.observersMu.RUnlock()
-	for _, o := range obs {
-		o.OnEvent(e)
+
+	if len(observers) > 0 {
+		b.observerPool.Notify(e, observers)
 	}
 }
 
 // BusBuilder constructs Bus instances (Builder pattern).
 type BusBuilder struct {
-	transportName string
-	transportCfg  map[string]any
-	transportInst Transport
-
-	codecName string
-	codecInst Codec
-
-	middlewares []Middleware
-	observers   []Observer
-	logger      *xlog.Logger
-	clock       xclock.Clock
-	ackTimeout  time.Duration
+	transportName      string
+	transportCfg       map[string]any
+	transportInst      Transport
+	codecName          string
+	codecInst          Codec
+	middlewares        []Middleware
+	observers          []Observer
+	logger             *xlog.Logger
+	clock              xclock.Clock
+	ackTimeout         time.Duration
+	observerWorkers    int
+	observerBufferSize int
 }
 
 // NewBusBuilder returns a new builder with sensible defaults.
 func NewBusBuilder() *BusBuilder {
 	return &BusBuilder{
-		codecName:  "json",
-		ackTimeout: 5 * time.Second, // safe default for production acknowledgments
+		codecName:          "json",
+		ackTimeout:         5 * time.Second,
+		observerWorkers:    4,
+		observerBufferSize: 1000,
 	}
 }
 
@@ -174,7 +295,7 @@ func (bb *BusBuilder) WithTransport(name string, cfg map[string]any) *BusBuilder
 	return bb
 }
 
-// WithTransportInstance accepts a ready Transport instance (e.g., from adapter Use()).
+// WithTransportInstance accepts a ready Transport instance.
 func (bb *BusBuilder) WithTransportInstance(t Transport) *BusBuilder {
 	bb.transportInst = t
 	return bb
@@ -228,6 +349,17 @@ func (bb *BusBuilder) WithAckTimeout(d time.Duration) *BusBuilder {
 	return bb
 }
 
+// WithObserverPool configures async observer pool workers and buffer size.
+func (bb *BusBuilder) WithObserverPool(workers, bufferSize int) *BusBuilder {
+	if workers > 0 {
+		bb.observerWorkers = workers
+	}
+	if bufferSize > 0 {
+		bb.observerBufferSize = bufferSize
+	}
+	return bb
+}
+
 func (bb *BusBuilder) Build() (*Bus, error) {
 	var tr Transport
 	var err error
@@ -260,23 +392,36 @@ func (bb *BusBuilder) Build() (*Bus, error) {
 	} else {
 		clk = xclock.Default()
 	}
+
 	var lg *xlog.Logger
 	if bb.logger != nil {
 		lg = bb.logger
 	} else {
-		// Default to xlog new logger; Adapter pattern to platform logging.
 		lg = xlog.Default()
 	}
+
+	// Pre-inject codec, logger, clock once to eliminate per-delivery context allocation
+	baseCtx := context.Background()
+	baseCtx = injectCodec(baseCtx, cd)
+	baseCtx = injectLogger(baseCtx, lg)
+	baseCtx = injectClock(baseCtx, clk)
+
+	// Create async observer pool for non-blocking event dispatch
+	pool := NewObserverPool(context.Background(), bb.observerWorkers, bb.observerBufferSize)
+
 	b := &Bus{
-		transport:   tr,
-		codec:       cd,
-		clock:       clk,
-		logger:      lg,
-		middlewares: bb.middlewares,
-		ackTimeout:  bb.ackTimeout,
+		transport:    tr,
+		codec:        cd,
+		clock:        clk,
+		logger:       lg,
+		middlewares:  bb.middlewares,
+		ackTimeout:   bb.ackTimeout,
+		observerPool: pool,
+		baseCtx:      baseCtx,
+		metrics:      &busMetrics{},
 	}
 
-	// Attach any configured observers.
+	// Attach configured observers
 	for _, o := range bb.observers {
 		b.AddObserver(o)
 	}
@@ -289,8 +434,7 @@ var (
 	defaultBusMu sync.Mutex
 )
 
-// Default returns the process-wide singleton Bus. If it isn't initialized yet,
-// it initializes it using the optional init function (Builder + Factory).
+// Default returns the process-wide singleton Bus.
 func Default() *Bus {
 	defaultBusMu.Lock()
 	defer defaultBusMu.Unlock()
@@ -307,7 +451,7 @@ func Default() *Bus {
 	return defaultBus
 }
 
-// SetDefault replaces the process-wide default Bus. Panics on nil.
+// SetDefault replaces the process-wide default Bus.
 func SetDefault(b *Bus) {
 	if b == nil {
 		panic("xbus: SetDefault called with nil Bus")

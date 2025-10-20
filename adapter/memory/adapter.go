@@ -15,8 +15,7 @@ const TransportName = "memory"
 
 func init() {
 	if err := xbus.RegisterTransport(TransportName, func(cfg map[string]any) (xbus.Transport, error) {
-		t := NewTransport(ConfigFromMap(cfg))
-		return t, nil
+		return NewTransport(ConfigFromMap(cfg)), nil
 	}); err != nil {
 		panic(fmt.Errorf("xbus/memory: failed to register transport: %w", err))
 	}
@@ -24,13 +23,13 @@ func init() {
 
 // Config controls memory transport behavior.
 type Config struct {
-	// BufferSize is the per-group queue size.
+	// BufferSize is the per-group queue size (default: 1024).
 	BufferSize int
-	// Concurrency is the default number of worker goroutines per subscription.
+	// Concurrency is the default number of worker goroutines per subscription (default: 1).
 	Concurrency int
-	// RedeliveryDelay is the delay before re-enqueuing a message on Nack. 0 means immediate requeue.
+	// RedeliveryDelay is the delay before re-enqueuing a message on Nack (default: 0 = immediate).
 	RedeliveryDelay time.Duration
-	// AssignIDs instructs the transport to assign IDs for messages that have empty ID.
+	// AssignIDs instructs the transport to assign IDs for messages with empty ID (default: true).
 	AssignIDs bool
 }
 
@@ -49,12 +48,14 @@ func ConfigFromMap(cfg map[string]any) Config {
 			return d
 		}
 	}
+
 	getBool := func(k string, d bool) bool {
 		if v, ok := cfg[k].(bool); ok {
 			return v
 		}
 		return d
 	}
+
 	getDur := func(k string, d time.Duration) time.Duration {
 		switch v := cfg[k].(type) {
 		case time.Duration:
@@ -68,14 +69,17 @@ func ConfigFromMap(cfg map[string]any) Config {
 		}
 		return d
 	}
+
 	return Config{
-		BufferSize:      getInt("buffer_size", 1024),
-		Concurrency:     getInt("concurrency", 1),
+		BufferSize:      maxInt(1, getInt("buffer_size", 1024)),
+		Concurrency:     maxInt(1, getInt("concurrency", 1)),
 		RedeliveryDelay: getDur("redelivery_delay", 0),
 		AssignIDs:       getBool("assign_ids", true),
 	}
 }
 
+// Transport implements xbus.Transport using in-memory channels (dev/testing).
+// Not suitable for production but excellent for local development and benchmarking.
 type Transport struct {
 	cfg Config
 
@@ -83,10 +87,23 @@ type Transport struct {
 	topics map[string]*topic
 
 	closed atomic.Bool
+
+	// Metrics for observability
+	metrics *transportMetrics
+}
+
+type transportMetrics struct {
+	published     atomic.Uint64
+	consumed      atomic.Uint64
+	acked         atomic.Uint64
+	nacked        atomic.Uint64
+	redelivered   atomic.Uint64
+	publishErrors atomic.Uint64
 }
 
 var _ xbus.Transport = (*Transport)(nil)
 
+// NewTransport creates a new in-memory transport.
 func NewTransport(cfg Config) *Transport {
 	if cfg.BufferSize < 1 {
 		cfg.BufferSize = 1024
@@ -94,12 +111,15 @@ func NewTransport(cfg Config) *Transport {
 	if cfg.Concurrency < 1 {
 		cfg.Concurrency = 1
 	}
+
 	return &Transport{
-		cfg:    cfg,
-		topics: make(map[string]*topic),
+		cfg:     cfg,
+		topics:  make(map[string]*topic),
+		metrics: &transportMetrics{},
 	}
 }
 
+// Publish fans out messages to all consumer groups for the topic.
 func (t *Transport) Publish(ctx context.Context, topic string, msgs ...*xbus.Message) error {
 	if t.closed.Load() {
 		return errors.New("memory transport is closed")
@@ -111,8 +131,9 @@ func (t *Transport) Publish(ctx context.Context, topic string, msgs ...*xbus.Mes
 	t.mu.RLock()
 	top, ok := t.topics[topic]
 	t.mu.RUnlock()
+
 	if !ok {
-		// No topic => no subscribers => drop (dev semantics).
+		// No topic registered => no subscribers => drop (in-memory dev semantics)
 		return nil
 	}
 
@@ -120,27 +141,38 @@ func (t *Transport) Publish(ctx context.Context, topic string, msgs ...*xbus.Mes
 		if m == nil {
 			continue
 		}
+
+		// Assign ID if configured and not provided
 		if t.cfg.AssignIDs && m.ID == "" {
 			m.ID = nextID()
 		}
-		// Fan-out to consumer groups where each group does one-of-N delivery.
+
+		// Fan-out to all consumer groups (one-of-N delivery per group)
 		top.mu.RLock()
 		for _, g := range top.groups {
-			// Copy pointer for safety if caller reuses structure; we reuse the same message for all groups.
 			select {
-			case g.queue <- &deliveryTask{
-				topic: topic,
-				group: g,
-				msg:   m,
-				tr:    t,
-			}:
 			case <-ctx.Done():
 				top.mu.RUnlock()
 				return ctx.Err()
+			case g.queue <- &deliveryTask{
+				topic:     topic,
+				group:     g,
+				msg:       m,
+				tr:        t,
+				createdAt: time.Now(),
+			}:
+				// Message queued
 			default:
-				// If queue is full, block respecting ctx to preserve ordering while not deadlocking indefinitely.
+				// Queue full: try blocking send to preserve ordering
 				select {
-				case g.queue <- &deliveryTask{topic: topic, group: g, msg: m, tr: t}:
+				case g.queue <- &deliveryTask{
+					topic:     topic,
+					group:     g,
+					msg:       m,
+					tr:        t,
+					createdAt: time.Now(),
+				}:
+					// Message queued after blocking
 				case <-ctx.Done():
 					top.mu.RUnlock()
 					return ctx.Err()
@@ -148,10 +180,14 @@ func (t *Transport) Publish(ctx context.Context, topic string, msgs ...*xbus.Mes
 			}
 		}
 		top.mu.RUnlock()
+
+		t.metrics.published.Add(1)
 	}
+
 	return nil
 }
 
+// Subscribe registers a handler for a topic/group with configurable concurrency.
 func (t *Transport) Subscribe(ctx context.Context, topic, group string, handler func(xbus.Delivery)) (xbus.Subscription, error) {
 	if t.closed.Load() {
 		return nil, errors.New("memory transport is closed")
@@ -160,34 +196,20 @@ func (t *Transport) Subscribe(ctx context.Context, topic, group string, handler 
 	top := t.ensureTopic(topic)
 	g := top.ensureGroup(group, t.cfg.BufferSize)
 
-	// subscription context
 	innerCtx, cancel := context.WithCancel(ctx)
-
-	// use configured concurrency; allow override via ctx value if needed in future
-	workers := t.cfg.Concurrency
 	wg := &sync.WaitGroup{}
+
+	// Spawn configured number of worker goroutines
+	workers := t.cfg.Concurrency
+	if workers < 1 {
+		workers = 1
+	}
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
-				select {
-				case <-innerCtx.Done():
-					return
-				case task := <-g.queue:
-					if task == nil {
-						// Shouldn't happen; we never close the queue.
-						continue
-					}
-					d := &memDelivery{
-						task:    task,
-						acked:   false,
-						ackOnce: sync.Once{},
-					}
-					handler(d)
-				}
-			}
+			t.worker(innerCtx, g, handler)
 		}()
 	}
 
@@ -195,21 +217,72 @@ func (t *Transport) Subscribe(ctx context.Context, topic, group string, handler 
 		close: func() error {
 			cancel()
 			wg.Wait()
-			// Keep group and queue alive for other subscribers.
+			// Keep group and queue alive for other subscribers
 			return nil
 		},
 	}, nil
 }
 
+// worker processes messages from the group queue.
+func (t *Transport) worker(ctx context.Context, g *group, handler func(xbus.Delivery)) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task := <-g.queue:
+			if task == nil {
+				continue // Shouldn't happen; we never close the queue
+			}
+
+			d := &memDelivery{
+				task:    task,
+				acked:   false,
+				ackOnce: sync.Once{},
+				tr:      task.tr,
+			}
+
+			t.metrics.consumed.Add(1)
+			handler(d)
+		}
+	}
+}
+
+// Close gracefully shuts down the transport.
 func (t *Transport) Close(_ context.Context) error {
-	t.closed.Store(true)
-	// Do not close queues: active subscriptions may still be draining via their own contexts.
-	// Best-effort cleanup: drop topic references so further Publishes fail early due to closed flag.
+	if t.closed.Swap(true) {
+		return nil // Already closed
+	}
+
 	t.mu.Lock()
 	t.topics = make(map[string]*topic)
 	t.mu.Unlock()
+
 	return nil
 }
+
+// Stats returns transport telemetry.
+type Stats struct {
+	Published     uint64
+	Consumed      uint64
+	Acked         uint64
+	Nacked        uint64
+	Redelivered   uint64
+	PublishErrors uint64
+}
+
+// Stats returns current transport metrics.
+func (t *Transport) Stats() Stats {
+	return Stats{
+		Published:     t.metrics.published.Load(),
+		Consumed:      t.metrics.consumed.Load(),
+		Acked:         t.metrics.acked.Load(),
+		Nacked:        t.metrics.nacked.Load(),
+		Redelivered:   t.metrics.redelivered.Load(),
+		PublishErrors: t.metrics.publishErrors.Load(),
+	}
+}
+
+// Internal types
 
 type subscription struct {
 	close func() error
@@ -233,76 +306,96 @@ type group struct {
 }
 
 type deliveryTask struct {
-	tr    *Transport
-	topic string
-	group *group
-	msg   *xbus.Message
+	tr        *Transport
+	topic     string
+	group     *group
+	msg       *xbus.Message
+	createdAt time.Time
 }
 
 type memDelivery struct {
 	task    *deliveryTask
 	acked   bool
 	ackOnce sync.Once
+	tr      *Transport
 }
 
-func (d *memDelivery) Message() *xbus.Message { return d.task.msg }
+func (d *memDelivery) Message() *xbus.Message {
+	return d.task.msg
+}
 
+// Ack marks the message as processed.
 func (d *memDelivery) Ack(_ context.Context) error {
 	d.ackOnce.Do(func() {
 		d.acked = true
+		d.tr.metrics.acked.Add(1)
 	})
 	return nil
 }
 
+// Nack negative-acknowledges the message for redelivery.
 func (d *memDelivery) Nack(ctx context.Context, _ error) error {
 	d.ackOnce.Do(func() {
-		// Re-enqueue for redelivery after configured delay.
-		delay := d.task.tr.cfg.RedeliveryDelay
+		d.tr.metrics.nacked.Add(1)
+		d.tr.metrics.redelivered.Add(1)
+
+		// Re-enqueue for redelivery after configured delay
+		delay := d.tr.cfg.RedeliveryDelay
 		if delay <= 0 {
+			// Immediate requeue
 			select {
 			case d.task.group.queue <- d.task:
 			case <-ctx.Done():
 			}
 			return
 		}
+
+		// Delayed requeue
 		timer := time.NewTimer(delay)
 		go func() {
 			defer timer.Stop()
 			select {
 			case <-timer.C:
-				// Best effort requeue; if queue is full, block unless ctx canceled.
+				// Best-effort requeue after delay
 				select {
 				case d.task.group.queue <- d.task:
 				case <-ctx.Done():
 				}
 			case <-ctx.Done():
-				return
 			}
 		}()
 	})
 	return nil
 }
 
+// Helper functions
+
 func (t *Transport) ensureTopic(name string) *topic {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	if tp, ok := t.topics[name]; ok {
 		return tp
 	}
-	tp := &topic{groups: make(map[string]*group)}
+
+	tp := &topic{
+		groups: make(map[string]*group),
+	}
 	t.topics[name] = tp
 	return tp
 }
 
-func (tp *topic) ensureGroup(name string, buffer int) *group {
+func (tp *topic) ensureGroup(name string, bufferSize int) *group {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
+
 	if g, ok := tp.groups[name]; ok {
 		return g
 	}
+
 	g := &group{
 		name:  name,
-		queue: make(chan *deliveryTask, buffer),
+		queue: make(chan *deliveryTask, bufferSize),
 	}
 	tp.groups[name] = g
 	return g
@@ -314,4 +407,11 @@ var idSeq uint64
 func nextID() string {
 	n := atomic.AddUint64(&idSeq, 1)
 	return fmt.Sprintf("mem-%d", n)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

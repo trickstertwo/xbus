@@ -1,6 +1,9 @@
 package xbus
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // EventType enumerates internal lifecycle events for Observer pattern.
 type EventType string
@@ -24,4 +27,12 @@ type Event struct {
 	EventName string
 	Duration  time.Duration
 	Err       error
+
+	// Internal: attached for async dispatch
+	observers []Observer
+}
+
+// eventPool reduces allocations for event objects (optional optimization)
+var eventPool = sync.Pool{
+	New: func() interface{} { return &Event{} },
 }
